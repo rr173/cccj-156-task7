@@ -37,6 +37,7 @@
     border:1px solid var(--line); border-radius:7px; padding:7px 10px; font:inherit; }
   textarea { width:100%; min-height:90px; }
   button { cursor:pointer; }
+  button:disabled { opacity:.45; cursor:default; }
   button.primary { border-color:var(--accent); color:var(--accent); }
   button.danger { border-color:var(--err); color:var(--err); }
   pre { white-space:pre-wrap; word-break:break-all; max-height:260px;
@@ -44,6 +45,10 @@
         border-radius:8px; padding:10px; font-size:12px; }
   .verdict { font-weight:700; padding:2px 9px; border-radius:999px;
              border:1px solid var(--line); display:inline-block; }
+  .badge { font-weight:800; font-size:13px; padding:3px 12px;
+           border-radius:999px; border:2px solid var(--line); }
+  .badge.PASS { color:var(--ok); border-color:var(--ok); }
+  .badge.FAIL { color:var(--err); border-color:var(--err); }
   .muted { color:var(--muted); }
   .mono { font-size:11.5px; color:var(--muted); }
 </style>
@@ -57,17 +62,22 @@
 </header>
 <main>
   <section class="panel" id="p-head">
-    <h2>当前 Tree Head</h2>
+    <h2>当前 Tree Head（认证徽章）</h2>
+    <div class="row"><span id="badge" class="badge">加载中…</span>
+      <span id="badge-note" class="mono"></span></div>
     <div id="headview" class="mono">加载中…</div>
     <div class="row" style="margin-top:10px">
-      <button class="primary" onclick="refresh()">刷新</button>
+      <button class="primary" id="btn-refresh" onclick="refresh()">刷新</button>
       <button onclick="pinCurrent()">固定当前 head 为可信</button>
+      <button onclick="verifyFullChain()">浏览器核验整条 head 链</button>
       <span id="pinned" class="mono"></span>
     </div>
     <div class="row">
       <span class="mono">本地固定可信 head：</span><span id="pininfo" class="mono"></span>
+      <span id="pincheck" class="mono"></span>
       <button onclick="unpin()">清除固定</button>
     </div>
+    <div id="chainresult" class="mono" style="margin-top:6px"></div>
   </section>
 
   <section class="panel" id="p-split">
@@ -77,7 +87,7 @@
       <input id="observer" placeholder="观察方标识(可选)"/>
       <button class="danger" onclick="submitObserved()">提交观察到的 head(粘贴于下)</button>
     </div>
-    <textarea id="obshead" placeholder='粘贴外部见到的已签名 head JSON'></textarea>
+    <textarea id="obshead" placeholder='粘贴外部见到的已签名 head JSON（签名无效的 head 形对象同样会记录冲突并冻结发布）'></textarea>
     <div id="obsresult" class="mono" style="margin-top:6px"></div>
   </section>
 
@@ -87,7 +97,7 @@
   </section>
 
   <section class="panel">
-    <h2>查询包含证明（浏览器侧重算）</h2>
+    <h2>查询包含证明（浏览器侧重算成员路径）</h2>
     <div class="row">
       <input id="inc-purpose" placeholder="purpose" value="root-signing"/>
       <input id="inc-version" placeholder="版本号" style="width:90px"/>
@@ -100,13 +110,33 @@
   </section>
 
   <section class="panel">
-    <h2>一致性：粘贴旧 head 核查严格追加</h2>
+    <h2>历史摘要核查（当前/任意历史/摘要链一致判定）</h2>
     <div class="row">
-      <input id="cons-oldsize" placeholder="旧树大小" style="width:110px"/>
+      <input id="hist-size" placeholder="树大小 size" style="width:110px"/>
+      <button class="primary" onclick="checkHistory()">核查该 size 的已签发摘要</button>
+    </div>
+    <div id="histresult"></div>
+  </section>
+
+  <section class="panel full">
+    <h2>一致性：用保存的旧摘要核对后续摘要（仅接受确实延长的序列）</h2>
+    <div class="row">
+      <input id="cons-oldsize" placeholder="旧树大小(可留空,用本地固定)" style="width:150px"/>
       <input id="cons-oldroot" placeholder="旧根(可留空,用本地固定)" style="flex:1"/>
     </div>
     <div class="row">
       <textarea id="cons-oldhead" placeholder="或直接粘贴旧的已签名 head JSON"></textarea>
+    </div>
+    <div class="row">
+      <label class="mono"><input type="checkbox" id="cons-pasted"
+        onchange="toggleCandidate()" style="width:auto;vertical-align:middle"/>
+        粘贴候选新树（否则核对服务器当前 head）</label>
+    </div>
+    <div class="row" id="candidate-box" style="display:none">
+      <textarea id="cons-leaves" placeholder="候选树全部叶子的有序 JSON 数组（删尾/换序/改早期条目/跨树混合都应失败）"></textarea>
+    </div>
+    <div class="row" id="candidate-head-box" style="display:none">
+      <textarea id="cons-newhead" placeholder="候选新 head JSON（可留空：用叶子重算根并取服务器同 size head 的签名）"></textarea>
     </div>
     <button class="primary" onclick="checkConsistency()">核查一致性</button>
     <div id="consresult"></div>
@@ -130,7 +160,11 @@
 <script>
 "use strict";
 const PIN_KEY = "kc-transparency-pinned-head-v1";
-let STATUS = null;
+const EMPTY_ROOT_HEX =
+  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const HEAD_DOMAIN = "kc-transparency-head-v1";
+const HEAD_FIELDS = ["domain", "tree_size", "root_hash", "issued_at",
+                     "prev_head_hash"];
 
 // ---------------------------------------------------------------------------
 // canonical JSON (must match kc.crypto.dumps: sort keys, compact, ascii)
@@ -151,11 +185,24 @@ function hex(b) {
   return [...b].map(x => x.toString(16).padStart(2, "0")).join("");
 }
 function unhex(h) {
-  h = h.replace(/\s+/g, "");
+  h = String(h).replace(/\s+/g, "");
+  if (h.length % 2 || /[^0-9a-fA-F]/.test(h))
+    throw new Error("not a hex string: " + h.slice(0, 16));
   const out = new Uint8Array(h.length / 2);
   for (let i = 0; i < out.length; i++)
     out[i] = parseInt(h.substr(i * 2, 2), 16);
   return out;
+}
+function b64Bytes(s) {
+  // Log keys/head signatures are standard base64 on the wire (kc.crypto.b64e),
+  // NOT hex. Works in browsers (atob) and the node test harness.
+  if (typeof atob === "function") {
+    const bin = atob(String(s).replace(/\s+/g, ""));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  return Uint8Array.from(Buffer.from(String(s), "base64"));
 }
 function eqBytes(a, b) {
   if (a.length !== b.length) return false;
@@ -163,9 +210,10 @@ function eqBytes(a, b) {
   return true;
 }
 async function leafHash(leaf) {
-  const pre = new Uint8Array(1 + asciiBytes(canonical(leaf)).length);
+  const body = asciiBytes(canonical(leaf));
+  const pre = new Uint8Array(1 + body.length);
   pre[0] = 0x00;
-  pre.set(asciiBytes(canonical(leaf)), 1);
+  pre.set(body, 1);
   return sha256Bytes(pre);
 }
 async function nodeHash(l, r) {
@@ -173,9 +221,9 @@ async function nodeHash(l, r) {
   b[0] = 0x01; b.set(l, 1); b.set(r, 1 + l.length);
   return sha256Bytes(b);
 }
-function emptyRoot() {
-  return hex(unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
-}
+function emptyRoot() { return unhex(EMPTY_ROOT_HEX); }
+// largest power of two strictly smaller than n; only valid for n >= 2
+// (mirrors kc.transparency._hp2; callers must special-case n <= 1).
 function hp2(n) { return 1 << (31 - Math.clz32(n - 1)); }
 
 async function mth(hashes, start, len) {
@@ -190,6 +238,16 @@ async function subtreeRange(hashes, start, len) {
   if (k === len) return mth(hashes, start, len);
   return nodeHash(await mth(hashes, start, k),
                   await subtreeRange(hashes, start + k, len - k));
+}
+async function rootOf(hashes) {
+  // RFC fold identical to kc tree_root; the length<=1 cases avoid clz32(0).
+  if (!hashes.length) return emptyRoot();
+  const n = hashes.length;
+  if (n === 1) return hashes[0];
+  const k = 1 << (31 - Math.clz32(n - 1));
+  if (k === n) return mth(hashes, 0, n);
+  return nodeHash(await mth(hashes, 0, k),
+                  await subtreeRange(hashes, k, n - k));
 }
 
 async function verifyInclusion(index, size, proof, leafH, root) {
@@ -209,10 +267,10 @@ async function verifyInclusion(index, size, proof, leafH, root) {
 }
 
 async function verifyConsistency(m, n, proof, oldRoot, newRoot) {
-  if (m < 0 || m > n) return false;
+  if (!Number.isInteger(m) || !Number.isInteger(n) || m < 0 || m > n)
+    return false;
   if (m === 0)
-    return eqBytes(oldRoot, unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"))
-      && proof.length === 0;
+    return eqBytes(oldRoot, emptyRoot()) && proof.length === 0;
   if (m === n) return eqBytes(oldRoot, newRoot) && proof.length === 0;
   let i = 0;
   const implicit = ((m & (m - 1)) === 0) ? oldRoot : null;
@@ -244,6 +302,34 @@ async function verifyConsistency(m, n, proof, oldRoot, newRoot) {
   catch (e) { return false; }
   if (i !== proof.length) return false;
   return eqBytes(oldH, oldRoot) && eqBytes(newH, newRoot);
+}
+
+// Deterministic consistency-proof generator ported verbatim from
+// kc/transparency.py (consistency_proof + _consistency_slots). The browser
+// builds proof nodes itself from the ordered leaf hashes it holds, so a
+// server cannot steer the check with spliced proof values.
+function consistencySlots(m, n, start) {
+  if (m === n) return [["seed", start, m]];
+  const k = hp2(n);
+  if (m > k)
+    return [["right", start + k, n - k]]
+      .concat(consistencySlots(m - k, n - k, start + k))
+      .concat([["left", start, k]]);
+  if (m === k)
+    return [["seed", start, k], ["right", start + k, n - k]];
+  return consistencySlots(m, k, start)
+    .concat([["right", start + k, n - k]]);
+}
+async function consistencyProofLocal(m, n, hashes) {
+  if (m === 0 || m === n) return [];
+  const out = [];
+  const slots = consistencySlots(m, n, 0);
+  for (let i = 0; i < slots.length; i++) {
+    const [kind, start, length] = slots[i];
+    if (kind === "seed" && i === 0 && (m & (m - 1)) === 0) continue;
+    out.push(hex(await subtreeRange(hashes, start, length)));
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -306,18 +392,6 @@ const Ed = (() => {
     if ((x & 1n) !== sign) x = P - x;
     return [x, y, 1n, x * y % P];
   }
-  function hint(m) {
-    // SHA-512 via subtle isn't SHA-512; implement using a small sha512 below
-    return Sha512.hash(m);
-  }
-  function secretScalar(seed) {
-    const h = Sha512.hash(seed);
-    let a = 0n;
-    for (let i = 0; i < 32; i++) a = (a << 8n) | BigInt(h[31 - i]); // little-endian
-    a &= (1n << 254n) - 8n;
-    a |= 1n << 254n;
-    return a % N;
-  }
   function verify(pub, msg, sig) {
     try {
       if (pub.length !== 32 || sig.length !== 64) return false;
@@ -336,8 +410,7 @@ const Ed = (() => {
       return hex(enc(lhs)) === hex(enc(rhs));
     } catch (e) { return false; }
   }
-  function pubFromSeed(seed) { return enc(scalarMult(secretScalar(seed), B)); }
-  return { verify, pubFromSeed, enc, dec };
+  return { verify, enc, dec };
 })();
 
 // minimal SHA-512 (needed by Ed25519 only)
@@ -409,30 +482,125 @@ const Sha512 = (() => {
 })();
 
 // ---------------------------------------------------------------------------
+// Head trust evaluation
+//
+// One pure, shared routine is the single source of truth for whether a signed
+// tree head is trusted. The current head, every historical head and the
+// full head chain all go through it, so verdicts cannot drift between panels
+// or between a fresh load and revisiting an old summary:
+//
+//   * signature verifies under the log public key (both are standard base64),
+//   * domain is the transparency head domain,
+//   * declared tree_size matches the independently counted leaves,
+//   * root_hash equals the root the browser recomputes from the ordered
+//     public leaf set (prefix [0, size)),
+//   * prev_head_hash chains to the immediately preceding head (ZERO at size
+//     0/1), which is itself evaluated by the same routine.
+//
+// All inputs are fetched (or pasted) and all outputs are recomputed; the
+// result is a deterministic function of them.
+// ---------------------------------------------------------------------------
+function headContent(head) {
+  const o = {};
+  for (const k of HEAD_FIELDS) o[k] = head[k];
+  return o;
+}
+function headSigningBytes(head) {
+  return asciiBytes(canonical(headContent(head)));
+}
+async function headHashOf(head) {
+  // mirrors kc.transparency.head_hash: SHA256(canonical(HEAD_FIELDS))
+  return hex(await sha256Bytes(headSigningBytes(head)));
+}
+function verifyHeadSig(pubB64, head) {
+  try {
+    if (!head || typeof head.tree_head_sig !== "string") return false;
+    return Ed.verify(b64Bytes(pubB64), headSigningBytes(head),
+                     b64Bytes(head.tree_head_sig));
+  } catch (e) { return false; }
+}
+async function prefixRoot(leafHashes, size) {
+  if (size === 0) return emptyRoot();
+  return rootOf(leafHashes.slice(0, size));
+}
+
+/**
+ * Evaluate one signed tree head against an independently known ordered leaf
+ * set and (optionally) the already-evaluated immediately preceding head.
+ *
+ * Returns {checks: {domain,sig,size,root,chain:[...bool with messages]},
+ *          trusted: bool}.
+ */
+async function evaluateHead(head, size, leafHashes, prevHead, pubB64) {
+  const checks = [];
+  const add = (ok, name, detail) => checks.push({ok, name, detail: detail || ""});
+
+  const isObj = head && typeof head === "object";
+  add(isObj && head.domain === HEAD_DOMAIN, "head domain",
+      isObj ? head.domain : "(非 head 对象)");
+  const sigOk = isObj && verifyHeadSig(pubB64, head);
+  add(sigOk, "head 签名(浏览器验, base64 日志公钥)");
+  const sizeOk = isObj && Number.isInteger(head.tree_size) &&
+                 head.tree_size === size;
+  add(sizeOk, "tree_size 与叶子数一致",
+      isObj ? `head=${head.tree_size} 期望=${size}` : "");
+
+  let rootOk = false;
+  let recomputedHex = null;
+  if (Array.isArray(leafHashes) &&
+      Number.isInteger(size) && size >= 0 && size <= leafHashes.length) {
+    try {
+      const recomputed = await prefixRoot(leafHashes, size);
+      recomputedHex = hex(recomputed);
+      rootOk = isObj && recomputedHex === head.root_hash;
+    } catch (e) { rootOk = false; }
+  }
+  add(rootOk, "浏览器重算根(0x00‖canonical 叶, RFC fold)",
+      recomputedHex ? `重算=${recomputedHex.slice(0,16)}…` : "");
+
+  // chain link: prev_head_hash must equal the predecessor's head_hash, ZERO
+  // before the first signed head.
+  let chainOk = false;
+  if (isObj) {
+    if (size <= 1) {
+      chainOk = head.prev_head_hash === "0".repeat(64);
+    } else if (prevHead) {
+      const prevHash = await headHashOf(prevHead);
+      chainOk = head.prev_head_hash === prevHash &&
+                prevHead.tree_size === size - 1;
+    }
+  }
+  add(size <= 1 ? chainOk : (prevHead ? chainOk : null),
+      "prev_head_hash 链接前一摘要",
+      size <= 1 ? "应为全零" : (prevHead ? "" : "未取到前一摘要"));
+
+  const trusted = checks.every(c => c.ok !== false);
+  return {checks, trusted, recomputed: recomputedHex};
+}
+
+// ---------------------------------------------------------------------------
 // API + UI
 // ---------------------------------------------------------------------------
 async function api(path, opts) {
   const r = await fetch(path, opts);
   return r.json();
 }
+const HAS_DOM = (typeof document !== "undefined" &&
+                 typeof document.getElementById === "function");
 function post(path, body, token) {
   const h = {"Content-Type": "application/json"};
   if (token) h["Authorization"] = "Bearer " + token;
   return api(path, {method:"POST", headers:h, body:JSON.stringify(body)});
 }
-function verdict(ok, text) {
+function verdictLine(ok, text) {
+  if (ok === null)
+    return `<span class="verdict muted">— 跳过</span> ${text||""}`;
   return `<span class="verdict ${ok?"PASS":"FAIL"}">${ok?"✔ 通过":"✘ 失败"}</span> ${text||""}`;
 }
-function headSigningBytes(head) {
-  return asciiBytes(canonical({domain:head.domain, tree_size:head.tree_size,
-    root_hash:head.root_hash, issued_at:head.issued_at,
-    prev_head_hash:head.prev_head_hash}));
-}
-async function verifyHeadSig(pubHex, head) {
-  try {
-    return Ed.verify(unhex(pubHex), headSigningBytes(head),
-                     unhex(head.tree_head_sig));
-  } catch (e) { return false; }
+function checksTable(checks) {
+  return "<table>" + checks.map(c =>
+    `<tr><td style="white-space:nowrap">${verdictLine(c.ok, c.name)}</td>
+      <td class="mono">${c.detail||""}</td></tr>`).join("") + "</table>";
 }
 function loadPinned() {
   try { return JSON.parse(localStorage.getItem(PIN_KEY) || "null"); }
@@ -441,12 +609,48 @@ function loadPinned() {
 function savePinned(h) { localStorage.setItem(PIN_KEY, JSON.stringify(h)); }
 function clearPinned() { localStorage.removeItem(PIN_KEY); }
 
-let LOG_PUB = null;
+// Immutable snapshot of one load; an epoch guard makes an overlapped refresh
+// unable to splice a newer STATUS into an older render (that race was why the
+// verdict could change after browsing old summaries and coming back).
+let SNAP = null;
+let EPOCH = 0;
+const headCache = new Map();   // size -> signed head (within the snapshot)
+
+async function fetchHeadAt(size, epoch) {
+  if (headCache.has(size)) return headCache.get(size);
+  const h = await api(`/api/transparency/head?size=${size}`);
+  if (epoch !== undefined && epoch !== EPOCH) return null;
+  headCache.set(size, h);
+  return h;
+}
+
 async function refresh() {
+  const epoch = ++EPOCH;
+  headCache.clear();
+  let btn = null;
+  try { btn = document.getElementById("btn-refresh"); } catch (e) { btn = null; }
+  if (btn) btn.disabled = true;
   try {
-    STATUS = await api("/api/transparency/status");
-    LOG_PUB = (await api("/api/transparency/log-pub")).log_pub;
-  } catch (e) { return; }  // offline / test harness: leave page inert
+    const [status, pubj, leavesResp] = await Promise.all([
+      api("/api/transparency/status"),
+      api("/api/transparency/log-pub"),
+      api("/api/transparency/leaves"),
+    ]);
+    if (epoch !== EPOCH) return;          // a newer refresh superseded us
+    if (!status || !pubj || !leavesResp || pubj.error) return;
+    const leafHashes = await Promise.all(leavesResp.leaves.map(leafHash));
+    if (epoch !== EPOCH) return;
+    SNAP = {epoch, status, pubB64: pubj.log_pub,
+            leaves: leavesResp.leaves, leafHashes};
+    renderAll();
+  } catch (e) {
+    // offline / test harness without a server: leave the page inert
+  } finally {
+    if (epoch === EPOCH && btn) btn.disabled = false;
+  }
+}
+
+function renderAll() {
   renderHead(); renderSplit(); renderLatest(); renderBranches(); renderPin();
 }
 function renderPin() {
@@ -454,76 +658,94 @@ function renderPin() {
   document.getElementById("pininfo").textContent = p
     ? `size=${p.tree_size} root=${(p.root_hash||"").slice(0,16)}…` : "(未固定)";
 }
+
 async function renderHead() {
-  const h = STATUS.head;
-  const sigOk = await verifyHeadSig(LOG_PUB, h);
-  // independently recompute current root from the leaf set
-  const leavesResp = await api("/api/transparency/leaves");
-  const hashes = await Promise.all(leavesResp.leaves.map(leafHash));
-  const recomp = hashes.length
-    ? (await rootOf(hashes)) : unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-  const rootOk = hex(recomp) === h.root_hash;
-  const sizeOk = h.tree_size === leavesResp.tree_size &&
-                 leavesResp.tree_size === hashes.length;
+  const snap = SNAP;
+  const h = snap.status.head;
+  const size = snap.status.tree_size;
+  let prevHead = null;
+  if (size >= 2) {
+    try { prevHead = await fetchHeadAt(size - 1, snap.epoch); }
+    catch (e) { prevHead = null; }
+    if (snap.epoch !== EPOCH) return;
+  }
+  const ev = await evaluateHead(h, size, snap.leafHashes, prevHead,
+                                snap.pubB64);
+  if (snap.epoch !== EPOCH) return;
+  const badge = document.getElementById("badge");
+  badge.className = "badge " + (ev.trusted ? "PASS" : "FAIL");
+  badge.textContent = ev.trusted ? "可信 TRUSTED" : "不可信 UNTRUSTED";
+  document.getElementById("badge-note").textContent = ev.trusted
+    ? "签名有效、根由公开叶子重算一致、摘要链接续"
+    : "至少一项浏览器侧核验未通过 —— 不要信任该摘要";
   document.getElementById("headview").innerHTML =
     `<table>
       <tr><th>tree size</th><td>${h.tree_size}</td></tr>
       <tr><th>root</th><td>${h.root_hash}</td></tr>
       <tr><th>issued</th><td>${h.issued_at}</td></tr>
-      <tr><th>prev head</th><td>${h.prev_head_hash.slice(0,24)}…</td></tr>
-      <tr><th>浏览器重算根</th><td>${verdict(rootOk && sizeOk,
-        `本地重算 ${hashes.length} 叶 → ${hex(recomp).slice(0,16)}…`)}</td></tr>
-      <tr><th>head 签名(浏览器验)</th><td>${verdict(sigOk,
-        "Ed25519 over canonical head")}</td></tr>
-      <tr><th>冻结</th><td>${STATUS.frozen
-        ? '<span class="pill FROZEN">FROZEN '+STATUS.frozen.kind+'</span>'
-        : '<span class="pill PASS">正常发布</span>'}</td></tr>
-    </table>`;
+      <tr><th>prev head</th><td>${(h.prev_head_hash||"").slice(0,24)}…</td></tr>
+     </table>
+     <div style="margin-top:6px">${checksTable(ev.checks)}</div>`;
+  renderPinStatus(snap, ev);
 }
-async function rootOf(hashes) {
-  // RFC fold identical to kc tree_root
-  if (!hashes.length) return unhex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-  const n = hashes.length;
-  const k = 1 << (31 - Math.clz32(n - 1));
-  if (k === n) return mth(hashes, 0, n);
-  return nodeHash(await mth(hashes, 0, k),
-                  await subtreeRange(hashes, k, n - k));
+
+async function renderPinStatus(snap, currentEval) {
+  const el = document.getElementById("pincheck");
+  const p = loadPinned();
+  if (!p) { el.textContent = ""; return; }
+  // The pinned anchor is only useful while it itself still verifies.
+  const sigOk = verifyHeadSig(snap.pubB64, p);
+  let rootOk = null;
+  if (Number.isInteger(p.tree_size) && p.tree_size <= snap.leafHashes.length) {
+    try {
+      rootOk = hex(await prefixRoot(snap.leafHashes, p.tree_size)) ===
+               p.root_hash;
+    } catch (e) { rootOk = false; }
+  }
+  const ok = sigOk && rootOk !== false;
+  el.innerHTML = verdictLine(ok,
+    `固定锚点自检 size=${p.tree_size}` +
+    (rootOk === null ? "（当前叶子不足以重算其根，仅验签名）" : ""));
 }
+
 function renderLatest() {
-  const rows = Object.values(STATUS.latest_by_purpose).map(v =>
-    `<tr><td>${"?"}</td></tr>`);
   let html = `<table><tr><th>purpose</th><th>最新版本</th><th>version_id</th>
     <th>公开状态</th><th>指纹</th><th>叶序号</th></tr>`;
-  for (const [purpose, v] of Object.entries(STATUS.latest_by_purpose)) {
+  for (const [purpose, v] of Object.entries(
+        SNAP.status.latest_by_purpose || {})) {
     html += `<tr><td>${purpose}</td><td>${v.version}</td>
       <td class="mono">${v.version_id}</td>
       <td><span class="pill ${v.state}">${v.state}</span></td>
       <td class="mono">${v.fingerprint}</td><td>${v.leaf_index}</td></tr>`;
   }
   html += `</table><div class="mono" style="margin-top:8px">待记录/过渡状态：` +
-    (STATUS.pending_events.length
-      ? STATUS.pending_events.map(e=>`${e.purpose} v${e.version}:${e.state}`).join("，")
+    ((SNAP.status.pending_events || []).length
+      ? SNAP.status.pending_events.map(e=>`${e.purpose} v${e.version}:${e.state}`).join("，")
       : "无") + "</div>";
   document.getElementById("latest").innerHTML = html;
 }
 function renderSplit() {
   const el = document.getElementById("splitview");
-  if (!STATUS.splits.length) { el.innerHTML = '<span class="muted">无 split-view 事件。</span>'; return; }
+  const splits = SNAP.status.splits || [];
+  if (!splits.length) { el.innerHTML = '<span class="muted">无 split-view 事件。</span>'; return; }
   el.innerHTML = "<table><tr><th>split</th><th>类型</th><th>状态</th><th>详情</th></tr>" +
-    STATUS.splits.map(s => `<tr><td class="mono">${s.split_id}</td>
+    splits.map(s => `<tr><td class="mono">${s.split_id}</td>
       <td>${s.kind}</td><td><span class="pill ${s.status}">${s.status}</span></td>
       <td class="mono">${JSON.stringify(s.detail)}</td></tr>`).join("") + "</table>";
 }
 function renderBranches() {
   const el = document.getElementById("branches");
-  const rejected = (STATUS.resolutions||[]).flatMap(r =>
+  const rejected = (SNAP.status.resolutions||[]).flatMap(r =>
     r.rejected && r.rejected.root ? [[r.split_id, r.rejected, r.reason, r.decided_by]] : []);
   let html = "";
-  if (STATUS.frozen) {
-    const d = STATUS.frozen.detail;
-    html += `<div>开放分裂 <b class="mono">${STATUS.frozen.split_id}</b>：本地 size=${d.size??d.smaller_size}
-      root=${((d.local_root ?? d.smaller_root) || "").slice(0,16)}… vs 观察到
-      ${((d.observed_root ?? d.larger_root) || "").slice(0,16)}…</div>`;
+  if (SNAP.status.frozen) {
+    const d = SNAP.status.frozen.detail || {};
+    const local = d.local_root ?? d.smaller_root;
+    const other = d.observed_root ?? d.larger_root;
+    html += `<div>开放分裂 <b class="mono">${SNAP.status.frozen.split_id}</b>
+      [${SNAP.status.frozen.kind}]：本地 size=${d.size??d.smaller_size}
+      root=${(local||"").slice(0,16)}… vs 提交
+      ${(other||"").slice(0,16)}…</div>`;
   }
   html += `<table><tr><th>split</th><th>被拒分支(保留为证据)</th><th>原因</th><th>操作人</th></tr>` +
     rejected.map(([sid, rej, reason, by]) =>
@@ -532,11 +754,80 @@ function renderBranches() {
   el.innerHTML = html || '<span class="muted">无冲突分支。</span>';
 }
 function pinCurrent() {
-  if (STATUS && STATUS.head) { savePinned(STATUS.head); renderPin();
-    document.getElementById("pinned").textContent = "已固定 size=" + STATUS.head.tree_size; }
+  if (SNAP && SNAP.status.head) {
+    savePinned(SNAP.status.head); renderPin();
+    document.getElementById("pinned").textContent =
+      "已固定 size=" + SNAP.status.head.tree_size;
+    renderPinStatus(SNAP, null);
+  }
 }
-function unpin() { clearPinned(); renderPin(); document.getElementById("pinned").textContent=""; }
+function unpin() {
+  clearPinned(); renderPin();
+  document.getElementById("pinned").textContent="";
+  document.getElementById("pincheck").textContent="";
+}
 
+// ---------------------------------------------------------------------------
+// historical head: same evaluation routine as the current head, plus an
+// optional strict-extension check against a saved/pinned older anchor.
+// ---------------------------------------------------------------------------
+async function checkHistory() {
+  const el = document.getElementById("histresult");
+  if (!SNAP) { el.innerHTML = verdictLine(false, "页面尚未加载"); return; }
+  const snap = SNAP;
+  const size = parseInt(document.getElementById("hist-size").value.trim(), 10);
+  if (!Number.isInteger(size) || size < 0 || size > snap.status.tree_size) {
+    el.innerHTML = verdictLine(false,
+      `需要 0..${snap.status.tree_size} 之间的树大小`);
+    return;
+  }
+  let head;
+  try {
+    head = size === snap.status.tree_size
+      ? snap.status.head : await fetchHeadAt(size, snap.epoch);
+  } catch (e) { head = null; }
+  if (!head || head.error) {
+    el.innerHTML = verdictLine(false, "无法取得该 size 的已签发摘要"); return;
+  }
+  const prevHead = size >= 2
+    ? await fetchHeadAt(size - 1, snap.epoch).catch(() => null) : null;
+  const ev = await evaluateHead(head, size, snap.leafHashes, prevHead,
+                                snap.pubB64);
+
+  // extension check vs the saved anchor: a later saved head must be derivable
+  // as a strict append of the pinned (size, root) using a path the browser
+  // computes itself from the ordered leaves.
+  let extHtml = "";
+  const pinned = loadPinned();
+  if (pinned && Number.isInteger(pinned.tree_size) &&
+      pinned.tree_size <= size && pinned.tree_size > 0) {
+    const pinSig = verifyHeadSig(snap.pubB64, pinned);
+    let extOk = false;
+    if (pinSig) {
+      if (pinned.tree_size === size) {
+        extOk = pinned.root_hash === head.root_hash;
+      } else {
+        const proof = await consistencyProofLocal(
+          pinned.tree_size, size, snap.leafHashes);
+        extOk = await verifyConsistency(
+          pinned.tree_size, size, proof,
+          unhex(pinned.root_hash), unhex(head.root_hash));
+      }
+    }
+    extHtml = `<div style="margin-top:6px">${verdictLine(
+      pinSig && extOk,
+      `相对本地固定锚点 size=${pinned.tree_size} 为严格追加`)}</div>`;
+  }
+  el.innerHTML =
+    `<div class="row"><span class="badge ${ev.trusted?"PASS":"FAIL"}">` +
+    (ev.trusted ? "可信" : "不可信") + `</span>
+     <span class="mono">head @ size=${size}</span></div>` +
+    checksTable(ev.checks) + extHtml;
+}
+
+// ---------------------------------------------------------------------------
+// inclusion (member path): rebuilt entirely in the browser
+// ---------------------------------------------------------------------------
 async function checkInclusion() {
   const purpose = document.getElementById("inc-purpose").value.trim();
   const version = document.getElementById("inc-version").value.trim();
@@ -547,60 +838,145 @@ async function checkInclusion() {
   if (vid) q.set("version_id", vid);
   const r = await api("/api/transparency/inclusion?" + q.toString());
   const el = document.getElementById("incresult");
-  if (r.error) { el.innerHTML = verdict(false, r.error + " " + (r.message||"")); return; }
+  if (r.error) { el.innerHTML = verdictLine(false, r.error + " " + (r.message||"")); return; }
+  const snap = SNAP;
   const lh = await leafHash(r.leaf);
   const leafHashOk = hex(lh) === r.leaf_hash;
+  // verifyInclusion decodes each proof node from hex itself; a non-hex node
+  // makes verification return false rather than throwing.
   const root = unhex(r.head.root_hash);
   const incOk = await verifyInclusion(r.leaf_index, r.tree_size,
                                       r.inclusion_path, lh, root);
-  // key material in the leaf is the public material the caller can compare
-  const sigOk = await verifyHeadSig(LOG_PUB, r.head);
+  // The attached head gets the same full evaluation as every other head.
+  const ev = snap ? await evaluateHead(
+    r.head, r.tree_size, snap.leafHashes,
+    r.tree_size >= 2
+      ? await fetchHeadAt(r.tree_size - 1, snap.epoch).catch(() => null)
+      : null,
+    snap.pubB64) : null;
   el.innerHTML =
-    `<div>${verdict(leafHashOk, "叶子哈希 = 0x00‖canonical(leaf) 本地重算")}</div>
-     <div>${verdict(incOk, `包含路径 idx=${r.leaf_index} size=${r.tree_size} → head 根`)}</div>
-     <div>${verdict(sigOk, "随附 head 签名有效")}</div>
+    `<div>${verdictLine(leafHashOk, "叶子哈希 = 0x00‖canonical(leaf) 本地重算")}</div>
+     <div>${verdictLine(incOk, `成员路径 idx=${r.leaf_index} size=${r.tree_size} → head 根（浏览器重算）`)}</div>
+     ${ev ? `<div class="row" style="margin-top:4px"><span class="badge ${ev.trusted?"PASS":"FAIL"}">随附 head ${ev.trusted?"可信":"不可信"}</span></div>${checksTable(ev.checks)}`
+          : `<div>${verdictLine(verifyHeadSig(SNAP ? SNAP.pubB64 : "", r.head), "随附 head 签名有效")}</div>`}
      <pre>${JSON.stringify({purpose:r.leaf.purpose, version:r.leaf.version,
        event:r.leaf.event, state:r.leaf.state, fingerprint:r.leaf.fingerprint,
        audit_ref:r.leaf.audit_ref, ceremony:r.leaf.ceremony_id}, null, 1)}</pre>`;
 }
 
+// ---------------------------------------------------------------------------
+// strict-append consistency vs a saved/pasted old head
+// ---------------------------------------------------------------------------
+function toggleCandidate() {
+  const on = document.getElementById("cons-pasted").checked;
+  document.getElementById("candidate-box").style.display = on ? "" : "none";
+  document.getElementById("candidate-head-box").style.display = on ? "" : "none";
+}
+
 async function checkConsistency() {
   const el = document.getElementById("consresult");
+  if (!SNAP) { el.innerHTML = verdictLine(false, "页面尚未加载"); return; }
+  const snap = SNAP;
   let oldSize = parseInt(document.getElementById("cons-oldsize").value.trim(), 10);
   let oldRootHex = document.getElementById("cons-oldroot").value.trim();
   const pasted = document.getElementById("cons-oldhead").value.trim();
   let oldHead = null;
+  let oldSigHtml = "";
   if (pasted) {
     try { oldHead = JSON.parse(pasted); }
-    catch (e) { el.innerHTML = verdict(false, "旧 head JSON 解析失败"); return; }
-    oldSize = oldHead.tree_size; oldRootHex = oldHead.root_hash;
-    const sigOk = await verifyHeadSig(LOG_PUB, oldHead);
-    var oldSigHtml = `<div>${verdict(sigOk, "旧 head 签名有效")}</div>`;
+    catch (e) { el.innerHTML = verdictLine(false, "旧 head JSON 解析失败"); return; }
+    if (!Number.isInteger(oldHead.tree_size)) {
+      el.innerHTML = verdictLine(false, "旧 head 缺少 tree_size"); return;
+    }
+    oldSize = oldHead.tree_size;
+    oldRootHex = oldHead.root_hash;
+    oldSigHtml = `<div>${verdictLine(verifyHeadSig(snap.pubB64, oldHead),
+      "旧 head 签名有效(base64 日志公钥)")}</div>`;
   } else {
     const pinned = loadPinned();
-    if ((!Number.isFinite(oldSize)) && pinned) { oldSize = pinned.tree_size; }
+    if ((!Number.isInteger(oldSize)) && pinned) oldSize = pinned.tree_size;
     if (!oldRootHex && pinned && pinned.tree_size === oldSize) {
       oldRootHex = pinned.root_hash; oldHead = pinned;
-      var oldSigHtml = `<div>${verdict(await verifyHeadSig(LOG_PUB, pinned),
+      oldSigHtml = `<div>${verdictLine(verifyHeadSig(snap.pubB64, pinned),
         "使用本地固定 head（localStorage），其签名有效")}</div>`;
-    } else oldSigHtml = "";
+    }
   }
-  if (!Number.isFinite(oldSize) || !oldRootHex) {
-    el.innerHTML = verdict(false, "需要旧树大小与旧根（或粘贴旧 head / 先固定）"); return;
+  if (!Number.isInteger(oldSize) || oldSize < 0 || !oldRootHex) {
+    el.innerHTML = verdictLine(false,
+      "需要旧树大小与旧根（或粘贴旧 head / 先固定）"); return;
   }
-  const r = await api(`/api/transparency/consistency?old_size=${oldSize}`);
-  if (r.error) { el.innerHTML = verdict(false, r.error); return; }
-  const newRoot = unhex(r.head.root_hash);
-  const ok = await verifyConsistency(oldSize, r.tree_size, r.consistency_path,
-                                     unhex(oldRootHex), newRoot);
-  const strictAppend = r.tree_size >= oldSize;
-  const newSig = await verifyHeadSig(LOG_PUB, r.head);
+  let oldRoot;
+  try { oldRoot = unhex(oldRootHex); }
+  catch (e) {
+    el.innerHTML = verdictLine(false, "旧根不是合法十六进制"); return;
+  }
+
+  const useCandidate = document.getElementById("cons-pasted").checked;
+  let newSize, newRoot, newHead, candidateHashes, fromLeaves;
+  if (useCandidate) {
+    // Candidate NEW tree: the browser holds its ordered public leaves and
+    // builds every proof node itself. Truncating the tail, reordering leaves,
+    // rewriting an early entry or splicing another tree's leaves all change
+    // the root over the old prefix, which is bound to the pinned old root.
+    let candLeaves;
+    try { candLeaves = JSON.parse(
+      document.getElementById("cons-leaves").value.trim() || "null"); }
+    catch (e) { el.innerHTML = verdictLine(false, "候选叶子 JSON 解析失败"); return; }
+    if (!Array.isArray(candLeaves) || !candLeaves.length) {
+      el.innerHTML = verdictLine(false, "需要候选树全部叶子的非空 JSON 数组");
+      return;
+    }
+    candidateHashes = await Promise.all(candLeaves.map(leafHash));
+    newSize = candidateHashes.length;
+    const newHeadPasted = document.getElementById("cons-newhead").value.trim();
+    if (newHeadPasted) {
+      try { newHead = JSON.parse(newHeadPasted); }
+      catch (e) {
+        el.innerHTML = verdictLine(false, "候选新 head JSON 解析失败"); return;
+      }
+    } else {
+      newHead = newSize === snap.status.tree_size ? snap.status.head
+        : await fetchHeadAt(newSize, snap.epoch).catch(() => null);
+    }
+    if (!newHead) {
+      el.innerHTML = verdictLine(false,
+        "未提供候选新 head，且服务器没有同 size 的已签发 head"); return;
+    }
+    fromLeaves = candidateHashes;
+  } else {
+    newSize = snap.status.tree_size;
+    newHead = snap.status.head;
+    fromLeaves = snap.leafHashes;
+  }
+
+  if (newSize < oldSize) {
+    el.innerHTML = oldSigHtml + verdictLine(false,
+      `候选序列 size=${newSize} 少于旧 size=${oldSize}：缺掉旧内容(删尾)，不是延长`);
+    return;
+  }
+
+  // old prefix must be present unchanged inside the candidate tree
+  const oldPrefixRoot = await prefixRoot(fromLeaves, oldSize);
+  const prefixOk = eqBytes(oldPrefixRoot, oldRoot);
+  const newRootRecomputed = await rootOf(fromLeaves);
+  newRoot = unhex(newHead.root_hash);
+  const newRootOk = eqBytes(newRootRecomputed, newRoot);
+
+  // proof nodes are computed locally from the candidate ordered leaves
+  const proof = newSize === oldSize ? []
+    : await consistencyProofLocal(oldSize, newSize, fromLeaves);
+  const ok = await verifyConsistency(oldSize, newSize, proof, oldRoot, newRoot);
+  const newSig = verifyHeadSig(snap.pubB64, newHead);
+
   el.innerHTML =
-    `<div>${verdict(ok && strictAppend,
-      `严格追加：${oldSize} → ${r.tree_size}（本地重算一致性路径）`)}</div>` +
-    (oldSigHtml||"") +
-    `<div>${verdict(newSig, "新 head 签名有效")}</div>` +
-    `<pre class="mono">path nodes: ${r.consistency_path.length}</pre>`;
+    oldSigHtml +
+    `<div>${verdictLine(prefixOk,
+      `候选树前 ${oldSize} 叶的根 == 固定旧根（缺尾/换序/改早期条目/跨树混合都会破坏此项）`)}</div>
+     <div>${verdictLine(newRootOk, `候选新根由 ${newSize} 叶本地重算一致`)}</div>
+     <div>${verdictLine(ok && newSize >= oldSize,
+      `严格追加：${oldSize} → ${newSize}（证明节点全部由浏览器从有序叶子生成）`)}</div>
+     <div>${verdictLine(newSig, "新 head 签名有效")}</div>
+     <pre class="mono">locally generated path nodes: ${proof.length}</pre>`;
 }
 
 async function submitObserved() {
@@ -608,13 +984,20 @@ async function submitObserved() {
   const raw = document.getElementById("obshead").value.trim();
   let head;
   try { head = JSON.parse(raw); }
-  catch (e) { el.innerHTML = verdict(false, "head JSON 解析失败"); return; }
+  catch (e) { el.innerHTML = verdictLine(false, "head JSON 解析失败"); return; }
   const observer = document.getElementById("observer").value.trim() || "browser";
+  // Browser-side pre-check is informational: the server independently decides
+  // the conflict; a head-shaped object with a bad signature is reported as a
+  // forged-attestation conflict (BAD_HEAD_SIGNATURE) and freezes publication.
+  const localSig = SNAP ? verifyHeadSig(SNAP.pubB64, head) : null;
   const r = await post("/api/transparency/observe", {head, observer});
-  if (r.error) { el.innerHTML = verdict(false, r.error+" "+(r.message||"")); return; }
+  if (r.error) { el.innerHTML = verdictLine(false, r.error+" "+(r.message||"")); return; }
   el.innerHTML = (r.frozen
-    ? verdict(false, "检测到 split-view，透明度发布已冻结")
-    : verdict(true, "已记录观察，未发现分叉")) +
+    ? verdictLine(false,
+      `检测到 split-view（${r.split && r.split.kind}），透明度发布已冻结；冲突已原样留存`)
+    : verdictLine(true, "已记录观察，未发现分叉")) +
+    (localSig === false
+      ? `<div>${verdictLine(false, "浏览器侧：该 head 签名对日志公钥无效(伪造认证)")}</div>` : "") +
     `<pre class="mono">${JSON.stringify(r.split&&r.split.detail||{}, null, 1)}</pre>`;
   refresh();
 }
@@ -624,20 +1007,96 @@ async function resolveSplit() {
   const token = document.getElementById("token").value.trim();
   const splitId = document.getElementById("resolve-split").value.trim();
   const reason = document.getElementById("resolve-reason").value.trim();
-  if (!token) { el.innerHTML = verdict(false, "需要 ROOT_OWNER 令牌"); return; }
-  if (!splitId || !reason) { el.innerHTML = verdict(false, "split_id 与原因必填"); return; }
-  // browser verifies the local current head is itself a verifiable extension
-  // of the last trusted anchor before asking the server to resolve.
-  const st = await api("/api/transparency/status");
+  if (!token) { el.innerHTML = verdictLine(false, "需要 ROOT_OWNER 令牌"); return; }
+  if (!splitId || !reason) { el.innerHTML = verdictLine(false, "split_id 与原因必填"); return; }
+  // Browser gate: the local current head must itself be a verifiable strict
+  // extension of the last trusted anchor before asking the server to resolve.
+  const snap = SNAP;
+  const st = snap.status;
   const chosen = st.head;
+  const anchor = st.trusted || {size: 0, root: EMPTY_ROOT_HEX};
+  let extendsTrusted = false;
+  if (verifyHeadSig(snap.pubB64, chosen)) {
+    if (chosen.tree_size === anchor.size) {
+      extendsTrusted = chosen.root_hash === anchor.root;
+    } else if (chosen.tree_size > anchor.size) {
+      const proof = await consistencyProofLocal(
+        anchor.size, chosen.tree_size, snap.leafHashes);
+      extendsTrusted = await verifyConsistency(
+        anchor.size, chosen.tree_size, proof,
+        unhex(anchor.root), unhex(chosen.root_hash));
+    }
+  }
+  if (!extendsTrusted) {
+    el.innerHTML = verdictLine(false,
+      "浏览器侧未能证明本地 head 是最后可信摘要的严格延长，拒绝提交");
+    return;
+  }
   const r = await post("/api/transparency/resolve",
     {split_id:splitId, chosen_head:chosen, reason}, token);
-  if (r.error) { el.innerHTML = verdict(false, r.error+" "+(r.message||"")); return; }
-  el.innerHTML = verdict(true, `已选择本地分支 size=${r.chosen_size} 并记录原因；被拒分支保留为证据`);
+  if (r.error) { el.innerHTML = verdictLine(false, r.error+" "+(r.message||"")); return; }
+  el.innerHTML = verdictLine(true,
+    `已选择本地分支 size=${r.chosen_size} 并记录原因；被拒分支保留为证据。重载后该分支仍由浏览器重算为可信。`);
   refresh();
 }
 
-refresh();
+// full head-chain audit: fetch every signed head, verify each with the same
+// routine and check the prev_head_hash links end to end. For a non-empty log
+// the committed chain starts at size 1 (its prev link is ZERO); the size-0
+// head is only meaningful/audited while the tree is still empty.
+async function verifyFullChain() {
+  const el = document.getElementById("chainresult");
+  const snap = SNAP;
+  if (!snap) return;
+  const total = snap.status.tree_size;
+  if (total === 0) {
+    const z = await api("/api/transparency/head?size=0").catch(() => null);
+    const ok = z && verifyHeadSig(snap.pubB64, z) &&
+               z.root_hash === EMPTY_ROOT_HEX && z.tree_size === 0;
+    el.innerHTML = verdictLine(ok, "空树 size=0 摘要：签名与空根" +
+      (ok ? "通过" : "失败"));
+    return;
+  }
+  el.textContent = `核验 1..${total} 中…`;
+  const epoch = snap.epoch;
+  let failures = [];
+  let prev = null;   // committed head n-1 (null -> ZERO link at size 1)
+  const CONC = 8;
+  for (let base = 1; base <= total; base += CONC) {
+    const batch = [];
+    for (let size = base; size < Math.min(base + CONC, total + 1); size++) {
+      batch.push((async () => {
+        const head = size === total
+          ? snap.status.head : await fetchHeadAt(size, epoch);
+        return {size, head};
+      })());
+    }
+    const got = await Promise.all(batch);
+    if (epoch !== EPOCH) return;
+    got.sort((a, b) => a.size - b.size);
+    for (const {size, head} of got) {
+      // evaluateHead expects a null predecessor for size 1 (it then demands
+      // the ZERO prev_head_hash); later heads link to the prior committed one.
+      const ev = await evaluateHead(head, size, snap.leafHashes,
+                                    size === 1 ? null : prev, snap.pubB64);
+      if (!ev.trusted)
+        failures.push(`size=${size}: ` +
+          ev.checks.filter(c => c.ok === false).map(c => c.name).join("; "));
+      prev = head;
+    }
+  }
+  if (epoch !== EPOCH) return;
+  el.innerHTML = failures.length
+    ? verdictLine(false, `head 链存在 ${failures.length} 处问题`) +
+      `<pre>${failmentsToPre(failures)}</pre>`
+    : verdictLine(true, `整条摘要链 1..${total}：签名/根/链接全部通过`);
+}
+function failmentsToPre(failures) {
+  return failures.slice(0, 20).map(f => "✘ " + f).join("\n") +
+         (failures.length > 20 ? `\n…另有 ${failures.length - 20} 处` : "");
+}
+
+if (HAS_DOM) refresh();
 </script>
 </body>
 </html>

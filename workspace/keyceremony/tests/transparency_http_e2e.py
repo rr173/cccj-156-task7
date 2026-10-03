@@ -305,6 +305,100 @@ main();
                for sp in st3["splits"]), \
         [(sp["split_id"], sp.get("status")) for sp in st3["splits"]]
 
+    # ---- 9. forged attestation head: conflict saved, publishing paused ----
+    s, cur = call("/api/transparency/status")
+    assert s == 200 and cur["frozen"] is None, cur
+    good_head = cur["head"]
+    forged = dict(good_head)
+    forged_bytes = bytearray(crypto.b64d(forged["tree_head_sig"]))
+    forged_bytes[0] ^= 0xFF
+    forged["tree_head_sig"] = crypto.b64e(bytes(forged_bytes))
+    s, r = call("/api/transparency/observe",
+                {"head": forged, "observer": "rogue-monitor"})
+    assert s == 200 and r["frozen"], (s, r)
+    assert r["split"]["kind"] == "BAD_HEAD_SIGNATURE", r["split"]
+    bad_split = r["split"]["split_id"]
+    # the forged submission is retained verbatim as evidence (the split
+    # record keeps the submitted head object; /export also keeps all
+    # observations for the offline checker).
+    s, frozen_status = call("/api/transparency/status")
+    assert frozen_status["frozen"] and \
+        frozen_status["frozen"]["split_id"] == bad_split
+    assert frozen_status["frozen"]["observed_head"]["tree_head_sig"] == \
+        forged["tree_head_sig"], "forged head must be retained as evidence"
+    print("forged-signature head recorded as BAD_HEAD_SIGNATURE conflict")
+
+    # junk (non-head) payloads are rejected without freezing; a head-shaped
+    # object with garbage signature bytes already created the conflict.
+    s, r = call("/api/transparency/observe",
+                {"head": {"tree_size": "nope", "root_hash": "x"}})
+    assert s == 422 and r["error"] == "TRANSPARENCY_BAD_HEAD", (s, r)
+
+    # historical verification is unaffected by the freeze
+    s, inc_old = call(
+        "/api/transparency/inclusion?purpose=root-signing&version=1")
+    assert s == 200 and verify_head_signature(log_pub, inc_old["head"])
+    s, signed2 = call("/api/sign",
+                      {"purpose": "root-signing", "message": "old-check"},
+                      token=tok_diego)
+    assert s == 200, (s, signed2)
+    print("historical proofs/signing unaffected during forged-auth freeze")
+
+    # recovery requires a reason and ROOT_OWNER, and must keep the rejected
+    # (forged) branch as evidence
+    s, r = call("/api/transparency/resolve",
+                {"split_id": bad_split, "chosen_head": good_head,
+                 "reason": ""}, token=tok_alice)
+    assert r["error"] == "TRANSPARENCY_RESOLUTION_REJECTED", (s, r)
+    s, r = call("/api/transparency/resolve",
+                {"split_id": bad_split, "chosen_head": good_head,
+                 "reason": "local log verified against out-of-band witnesses"},
+                token=tok_alice)
+    assert s == 200 and r["chosen_size"] == good_head["tree_size"], (s, r)
+    assert r["rejected"]["root"] == good_head["root_hash"]
+    s, resolved_status = call("/api/transparency/status")
+    assert resolved_status["frozen"] is None
+    print("forged-auth split resolved with reason; rejected head retained")
+
+    # ---- 10. reopen the page view: same head still TRUSTED in the browser -
+    if node:
+        html2 = urllib.request.urlopen(BASE + "/transparency").read().decode()
+        js2 = re.search(r"<script>(.*)</script>", html2, re.S).group(1)
+        s, st4 = call("/api/transparency/status")
+        s, lv = call("/api/transparency/leaves")
+        s, pub4 = call("/api/transparency/log-pub")
+        s, prevj = call(f"/api/transparency/head?size={st4['tree_size']-1}")
+        pay4 = {"status": st4, "leaves": lv["leaves"],
+                "log_pub": pub4["log_pub"], "prev": prevj}
+        driver2 = (
+            "const __PAY=" + json.dumps(pay4) + ";\n"
+            "const __els={};const localStorage={getItem:()=>null,"
+            "setItem:()=>{},removeItem:()=>{}};"
+            "const document={getElementById:id=>__els[id]||"
+            "(__els[id]={innerHTML:'',textContent:'',value:'',style:{}}),"
+            "addEventListener:()=>{}};"
+            "const fetch=async()=>({json:async()=>({})});\n"
+            + js2.replace("\nif (HAS_DOM) refresh();", "") + """
+(async function(){
+  const leafHashes = await Promise.all(__PAY.leaves.map(leafHash));
+  const h = __PAY.status.head, size = __PAY.status.tree_size;
+  const prev = size >= 2 ? __PAY.prev : null;
+  const ev = await evaluateHead(h, size, leafHashes, prev, __PAY.log_pub);
+  console.log(JSON.stringify({trusted: ev.trusted,
+    failed: ev.checks.filter(c=>c.ok===false).map(c=>c.name),
+    frozen: __PAY.status.frozen === null}));
+})();
+""")
+        n2 = subprocess.run([node, "-e", driver2],
+                            capture_output=True, text=True)
+        assert n2.returncode == 0, n2.stderr
+        verdict2 = json.loads(n2.stdout.strip().splitlines()[-1])
+        assert verdict2 == {"trusted": True, "failed": [], "frozen": True}, \
+            verdict2
+        print("after reload+recovery the current head still verifies trusted")
+    else:
+        print("node unavailable; skipping post-reload browser verdict")
+
     print("TRANSPARENCY HTTP E2E PASSED")
 finally:
     proc.terminate()

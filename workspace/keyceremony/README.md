@@ -195,10 +195,10 @@ RFC 6962 式 Merkle 树；每次提交发布带服务身份 Ed25519 签名的 tr
 | **单一提交边界** | “分配序号 → 写叶子 → 更新树节点 → 发布 head”为一个事务。独立模式：`pending/<txn>.json` 意图 fsync → 追加叶子行 fsync → checkpoint 单次原子 rename。重开时在 flock 内恢复：叶子已持久化则**前滚**补发完整新 head，否则**回滚**截断悬空叶子；只能看到完整旧 head 或完整新 head。测试在“写叶子/更新节点/发布 head”附近（含 rename 后）用真实子进程 `os._exit` 注入中断。嵌入模式与编排器共用 `state.json` 原子 rename 边界。 |
 | **多服务进程并发追加** | 独立构建器自带跨线程 RLock + flock，所有临时文件名带 pid+随机后缀，log 身份用 `O_CREAT\|O_EXCL` 原子认领；拿锁后先从磁盘重载再恢复。两个发布者争抢同一树大小时恰好一个生效，输方读到已生效结果（同业务键幂等）。测试 6 进程并发追加 12 个不同叶子 + 6 次重复投递，最终序号 0..16 确定无遗漏、head 链连续。 |
 | **抹除后公开材料仍可查** | DESTROY 只零化私钥封装，叶子与公钥/指纹永久保留；旧代的包含证明、状态历史、历史签名验签照常。 |
-| **Gossip split-view** | 浏览器/外部监控可免登录 `POST /api/transparency/observe` 提交自己见到的**已签名 head**。同树大小出现不同根（`SAME_SIZE_DIFFERENT_ROOT`），或更大 head 不能由本地较小 head 的一致性证明推出（`LARGER_HEAD_NOT_EXTENSION`），记录 split-view 事件并**冻结透明度发布**。被拒 head 原样保留为证据。 |
+| **Gossip split-view** | 浏览器/外部监控可免登录 `POST /api/transparency/observe` 提交自己见到的**已签名 head**。同树大小出现不同根（`SAME_SIZE_DIFFERENT_ROOT`），更大 head 不能由本地较小 head 的一致性证明推出（`LARGER_HEAD_NOT_EXTENSION`），或提交的 head 形对象**签名对日志公钥无效（伪造认证，`BAD_HEAD_SIGNATURE`）**，都记录 split-view 事件并**冻结透明度发布**；伪造/分叉 head 原样保留为证据。结构性非 head 载荷（缺字段/类型错误）仍返回 `422 TRANSPARENCY_BAD_HEAD`，不创建冲突（防止任意垃圾报文冻结）。 |
 | **冻结不影响历史验签，但阻止新密钥激活** | 冻结期间 `sign/verify` 与全部历史验证照常；GENERATE/ROTATE 的物化 commit 与 handover 发布（含四眼批准路径）抛 `TRANSPARENCY_FROZEN`，杜绝“已激活但无透明度叶子”。 |
 | **带原因的分支处置** | `POST /api/transparency/resolve`（仅 ROOT_OWNER）必须选**可证明延伸自本地链/最后可信 head** 的分支并填写原因；另一分支作为拒绝证据保留，随后重建从最后可信 head 开始的连续链，发布恢复。无原因/选择不可验证分支都被拒绝。 |
-| **管理页面浏览器侧自行验算** | `/transparency` 展示当前 head、树大小、各用途最新公开版本、待记录状态事件、split-view 与处置记录。包含/一致性/head 签名全部在浏览器侧用 Web Crypto(SHA-256) 与内置纯 JS Ed25519(RFC 8032，含 SHA-512) **重新计算并明确显示通过/失败**，不把“接口返回成功”当结果；固定的可信 head 存 localStorage，刷新后保留。 |
+| **管理页面浏览器侧自行验算（当前/任意历史/摘要链判定一致且可复现）** | `/transparency` 展示当前 head（顶部认证徽章）、树大小、各用途最新公开版本、待记录状态事件、split-view 与处置记录。当前 head、任意历史 size 的 head、以及整段 `prev_head_hash` 摘要链都走同一个纯函数判定：head 签名（日志公钥与签名均为 **base64** 传输，浏览器按 base64 解码后用内置纯 JS Ed25519/RFC 8032 验，含 SHA-512）、`tree_size` 与公开叶子数一致、`root_hash` 等于浏览器用 Web Crypto(SHA-256) 重算的根、且前一摘要链接正确。一次加载在 epoch 快照内完成全部核验，重叠刷新不会串状态，因此重载/来回切换历史后结论不变；原样 head 报可信，只改摘要内容或认证字段即报不可信。包含/成员路径在浏览器内重算；一致性面板用保存的旧 head 与候选叶子**本地生成证明节点**，严格延长才通过，删尾、换序、改早期条目、混用另一棵树均被挡住。固定的可信 head 存 localStorage，刷新后保留。 |
 | **独立检查程序** | `python -m kc.transparency_cli verify <export.json|section.json>` 输入叶子集合、head 链、签名、split 处置记录，重算全部根并校验生命周期。检出：缺叶(`MISSING_LEAF`)、重复业务事件(`DUPLICATE_BUSINESS_EVENT`)、叶子调序/换钥(`LEAF_REORDERED`)、错误包含证明(`BAD_INCLUSION_PROOF`)、断裂一致性(`BROKEN_CONSISTENCY`)、head 签名替换(`HEAD_SIGNATURE_REPLACED`)、同大小双根(`SAME_SIZE_TWO_ROOTS`)、跳过冲突直接发布(`PUBLISHED_DURING_SPLIT`)、密钥已激活但无叶子(`ACTIVATION_WITHOUT_LEAF`)、非法状态跳转(`ILLEGAL_LIFECYCLE_EDGE`)、换钥绑定(`CONTRADICTORY_KEY_BINDING`)、处置无效/拒绝证据缺失等。导出包整体校验新增 `transparency_ok`。 |
 
 透明度公开接口（**均免登录**，任何调用方/监控都能核对；处置需 ROOT_OWNER 令牌）：
@@ -271,15 +271,22 @@ tests/
   test_archive.py     35 个审计档案场景（乱序补齐、重复幂等、同序冲突隔离与处置、
                       拒绝版本幂等、中断续跑、线程/进程收敛、门限拒绝、CAS 唯一发布、
                       迟到数据进下一轮、离线验证正常通过与 12 类篡改失败、HTTP 全流程）
-  test_transparency.py 36 个透明度场景（Merkle 包含/一致性全几何穷举与篡改、公开性、
+  test_transparency.py 38 个透明度场景（Merkle 包含/一致性全几何穷举与篡改、公开性、
                       业务去重、矛盾状态/换钥阻止 head、多进程单序并发、四类中断
-                      原子前滚/回滚、split-view 冻结/冻结期阻断激活/处置恢复/重启保留、
-                      嵌入编排器两代证明与多次变更一致性、独立检查器 10 类检出）
+                      原子前滚/回滚、split-view 冻结（同高分叉/坏签名）/冻结期阻断激活/
+                      处置恢复/重启保留、嵌入编排器两代证明与多次变更一致性、
+                      独立检查器 10 类检出）
   http_e2e.py         HTTP 全流程含登录门禁、四类授权单、6 路并发批准、库直调不受限
   drill_http_e2e.py   演练 HTTP 全流程（区域/修订/扫描/续跑/镜像/冻结/租约/受阻清理/证据）
   transparency_http_e2e.py 透明度 HTTP 全流程（公开证明、node 执行页面 JS 浏览器侧验算、
-                      gossip 冻结、冻结期四眼发布被阻、历史验签可用、owner 带原因
-                      处置后四眼发布恢复、一致性严格追加、拒绝分支留证）
+                      gossip 同高分叉与坏签名冻结、冻结期四眼发布被阻、历史验签可用、
+                      owner 带原因处置后四眼发布恢复、重载后该分支仍可信、一致性严格
+                      追加、拒绝分支留证）
+  transparency_browser.py + transparency_browser_driver.js
+                      直接执行 transparency.html 内的浏览器 JS（node），覆盖认证徽章、
+                      成员路径、历史/摘要链一致、可复现、改内容/认证字段不可信、
+                      合法延长通过与删尾/换序/改早期/跨树混合失败、SHA-512/Ed25519
+                      标准向量
 ```
 
 ## 3. 快速开始
@@ -421,6 +428,7 @@ python3 -m unittest tests.test_ceremonies tests.test_edge tests.test_authz tests
 python3 tests/http_e2e.py 8211          # 登录门禁 + 四类四眼授权单 + 6 路并发批准 + 库直调
 python3 tests/drill_http_e2e.py 8212    # 跨区域灾备演练 HTTP 全流程
 python3 tests/transparency_http_e2e.py 8213  # 透明度证明/浏览器验算/split 冻结处置
+python3 tests/transparency_browser.py         # 徽章/成员路径/历史链/重载/篡改/分歧 浏览器侧判定
 # 或一次跑完：
 ./run_tests.sh 8301 8302 8303
 ```

@@ -429,13 +429,67 @@ class TestSplitView(unittest.TestCase):
                                NONE_STATE, "c", "a3"))
             self.assertEqual(l.size, 3)
 
-    def test_invalid_signature_observation_rejected(self):
+    def test_forged_signature_observation_freezes_and_is_evidence(self):
+        # A head-shaped submission whose signature does not verify is forged
+        # attestation: it is retained verbatim and opens a BAD_HEAD_SIGNATURE
+        # split that freezes publication; historical verification is unaffected.
         self._grow(1)
         with self.log.locked() as l:
             h = l.current_head()
-            h["tree_head_sig"] = "x" + h["tree_head_sig"][1:]
-            with self.assertRaises(T.BadHead):
-                l.observe_head(h)
+            forged = dict(h)
+            forged["tree_head_sig"] = "x" + h["tree_head_sig"][1:]
+            r = l.observe_head(forged, "rogue-monitor")
+            self.assertTrue(r["frozen"])
+            self.assertEqual(r["split"]["kind"], "BAD_HEAD_SIGNATURE")
+            self.assertEqual(l.cp["frozen"]["split_id"],
+                             r["split"]["split_id"])
+            with self.assertRaises(PublicationFrozen):
+                l.record(make_leaf("p", 2, "v2", "fp2", "P2", STAGED,
+                                   NONE_STATE, "c", "ax"))
+            # the forged head is retained as-is for evidence/audit
+            stored = l.cp["observations"][-1]
+            self.assertEqual(stored["observer"], "rogue-monitor")
+            self.assertEqual(stored["head"]["tree_head_sig"],
+                             forged["tree_head_sig"])
+            # recovery semantics are unchanged: the local branch with a
+            # recorded reason resolves it and publication resumes
+            l.resolve_split(r["split"]["split_id"], l.current_head(),
+                            "forged attestation confirmed out of band",
+                            "alice")
+            self.assertIsNone(l.cp["frozen"])
+            l.record(make_leaf("p", 2, "v2", "fp2", "P2", STAGED,
+                               NONE_STATE, "c", "ax"))
+            self.assertEqual(l.size, 2)
+
+    def test_junk_observation_payload_rejected_without_freeze(self):
+        # structurally malformed submissions still get BadHead and must not
+        # freeze the log (trivial-submission denial-of-service guard)
+        self._grow(1)
+        with self.log.locked() as l:
+            for junk in ("not-a-head", ["x"], {}, {"tree_size": 3},
+                         {"tree_size": "abc", "root_hash": "a"}):
+                with self.assertRaises(T.BadHead):
+                    l.observe_head(junk)
+            self.assertIsNone(l.cp.get("frozen"))
+            self.assertEqual(l.cp.get("splits", []), [])
+
+    def test_forged_signature_freeze_survives_reopen(self):
+        self._grow(1)
+        with self.log.locked() as l:
+            h = l.current_head()
+            forged = dict(h)
+            raw = bytearray(crypto.b64d(forged["tree_head_sig"]))
+            raw[0] ^= 0x01
+            forged["tree_head_sig"] = crypto.b64e(bytes(raw))
+            sid = l.observe_head(forged, "w")["split"]["split_id"]
+        log2 = TransparencyLog(self.dir)
+        with log2.locked() as l2:
+            self.assertEqual(l2.cp["frozen"]["split_id"], sid)
+            self.assertEqual(l2.cp["frozen"]["kind"],
+                             "BAD_HEAD_SIGNATURE")
+            with self.assertRaises(PublicationFrozen):
+                l2.record(make_leaf("p", 2, "v2", "fp2", "P2", STAGED,
+                                    NONE_STATE, "c", "ax"))
 
     def test_freeze_survives_reopen(self):
         self._grow(1)
@@ -713,8 +767,12 @@ class TestIndependentChecker(unittest.TestCase):
 
     def test_head_signature_replaced(self):
         def m(s, k):
-            s["heads"][-1]["tree_head_sig"] = \
-                "A" + s["heads"][-1]["tree_head_sig"][1:]
+            # Flip a bit in the signature *bytes* (re-encode); editing a
+            # base64 character in place can leave the leading decoded byte
+            # unchanged and make the mutation a no-op intermittently.
+            raw = bytearray(crypto.b64d(s["heads"][-1]["tree_head_sig"]))
+            raw[8] ^= 0x01
+            s["heads"][-1]["tree_head_sig"] = crypto.b64e(bytes(raw))
         ok, codes = self.codes(m)
         self.assertIn("HEAD_SIGNATURE_REPLACED", codes)
 

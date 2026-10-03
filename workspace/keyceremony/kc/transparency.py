@@ -857,16 +857,26 @@ class TransparencyLog:
     # ---- gossip / split-view ----------------------------------------------
     def observe_head(self, observed: dict, observer: str = "external") -> dict:
         """Submit a signed head seen by an external monitor. Returns the
-        observation record; a conflicting view freezes publication."""
-        pub = ed25519.public_from_secret(self.seed)
-        if not verify_head_signature(pub, observed):
-            raise BadHead("observed head has an invalid log signature")
+        observation record; a conflicting view freezes publication.
+
+        A structurally malformed payload is rejected (BadHead). A head-shaped
+        submission whose signature does not verify under the log key is
+        *forged attestation*: it is retained verbatim as evidence and opens a
+        ``BAD_HEAD_SIGNATURE`` split that freezes publication, exactly like a
+        same-height equivocation. Historical verification is unaffected."""
+        if not self._well_formed_head(observed):
+            raise BadHead("observed payload is not a tree-head object")
         size = int(observed["tree_size"])
         root = observed["root_hash"]
+        pub = ed25519.public_from_secret(self.seed)
         rec = {"observer": observer, "submitted_at": utcnow_ts(self.clock),
                "size": size, "root": root, "head": observed}
         self.cp.setdefault("observations", []).append(rec)
-        split = self._detect_split(observed)
+        split = None
+        if not verify_head_signature(pub, observed):
+            split = self._forged_signature_record(observed, observer)
+        else:
+            split = self._detect_split(observed)
         if split and not self.cp.get("frozen"):
             self.cp["frozen"] = split
             self.cp.setdefault("splits", []).append(split)
@@ -874,6 +884,24 @@ class TransparencyLog:
                 self._persist_checkpoint()
         return {"observation": rec, "split": split,
                 "frozen": bool(self.cp.get("frozen"))}
+
+    @staticmethod
+    def _well_formed_head(observed) -> bool:
+        """A gossip submission must look like a signed tree head: the five
+        head-content fields plus the signature. This rejects junk (strings,
+        lists, missing fields) without accepting it as evidence; a complete
+        head-shaped object with a bad/forged signature still passes this gate
+        and is handled as a split-view event."""
+        if not isinstance(observed, dict):
+            return False
+        try:
+            int(observed["tree_size"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return all(k in observed for k in
+                   HEAD_FIELDS + ("tree_head_sig",)) and \
+            isinstance(observed["root_hash"], str) and \
+            isinstance(observed["tree_head_sig"], str)
 
     def _detect_split(self, observed: dict) -> dict | None:
         size = int(observed["tree_size"])
@@ -895,6 +923,19 @@ class TransparencyLog:
                  "smaller_root": self.cp["root"],
                  "larger_size": size, "larger_root": root})
         return None
+
+    def _forged_signature_record(self, observed: dict,
+                                 observer: str) -> dict:
+        """Evidence record for a head-shaped submission with an invalid log
+        signature. Resolution semantics are unchanged: the operator must pick
+        the branch provably extending the last trusted anchor, and the forged
+        submission is retained as the rejected evidence."""
+        size = int(observed["tree_size"])
+        detail = {"size": size, "observed_root": observed["root_hash"],
+                  "observer": observer, "reason": "signature_invalid"}
+        if 0 < size <= self.cp["size"]:
+            detail["local_root"] = self.cp["heads"][size - 1]["root_hash"]
+        return self._split_record("BAD_HEAD_SIGNATURE", observed, detail)
 
     def _split_record(self, kind: str, observed: dict, detail: dict) -> dict:
         return {"split_id": "split_" + os.urandom(8).hex(),
