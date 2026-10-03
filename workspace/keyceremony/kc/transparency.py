@@ -857,15 +857,41 @@ class TransparencyLog:
     # ---- gossip / split-view ----------------------------------------------
     def observe_head(self, observed: dict, observer: str = "external") -> dict:
         """Submit a signed head seen by an external monitor. Returns the
-        observation record; a conflicting view freezes publication."""
+        observation record; a conflicting view freezes publication.
+
+        A head carrying an invalid log signature is an attestation attack:
+        the attempt is retained as evidence AND opens a split-view freeze
+        ("continue to save conflicts and stop new publication" for forged
+        attestation input). The 422 BadHead response is preserved for callers
+        that only want to know the input was rejected.
+        """
         pub = ed25519.public_from_secret(self.seed)
-        if not verify_head_signature(pub, observed):
-            raise BadHead("observed head has an invalid log signature")
-        size = int(observed["tree_size"])
-        root = observed["root_hash"]
+        size = int(observed.get("tree_size", -1)) \
+            if isinstance(observed, dict) else -1
+        root = observed.get("root_hash") if isinstance(observed, dict) else None
         rec = {"observer": observer, "submitted_at": utcnow_ts(self.clock),
                "size": size, "root": root, "head": observed}
         self.cp.setdefault("observations", []).append(rec)
+        if not verify_head_signature(pub, observed):
+            # Forged attestation: keep the conflict evidence, freeze new
+            # publication (identical gating to an equivocation), then still
+            # answer BadHead so existing clients/API contract see rejection.
+            split = None
+            if not self.cp.get("frozen"):
+                split = self._split_record(
+                    "INVALID_HEAD_SIGNATURE", observed,
+                    {"size": max(size, 0),
+                     "local_size": self.cp["size"],
+                     "local_root": self.cp["root"],
+                     "observed_root": root})
+                split["observation"] = {
+                    "observer": observer, "submitted_at": rec["submitted_at"]}
+                self.cp["frozen"] = split
+                self.cp.setdefault("splits", []).append(split)
+                if not self.embedded:
+                    self._persist_checkpoint()
+            raise BadHead(
+                "observed head has an invalid log signature")
         split = self._detect_split(observed)
         if split and not self.cp.get("frozen"):
             self.cp["frozen"] = split

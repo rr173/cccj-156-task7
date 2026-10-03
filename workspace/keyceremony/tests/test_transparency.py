@@ -429,13 +429,71 @@ class TestSplitView(unittest.TestCase):
                                NONE_STATE, "c", "a3"))
             self.assertEqual(l.size, 3)
 
-    def test_invalid_signature_observation_rejected(self):
+    def test_invalid_signature_observation_freezes_and_keeps_evidence(self):
+        # A forged attestation is untrusted input: the API still answers
+        # BadHead, but the attempt is retained as evidence, publication is
+        # frozen, historical verification stays intact, and an owner can
+        # recover from the provable local branch with a reason.
+        self._grow(2)
+        with self.log.locked() as l:
+            h = l.current_head()
+            before = len(l.cp.get("observations", []))
+            forged = dict(h)
+            forged["tree_head_sig"] = "x" + h["tree_head_sig"][1:]
+            with self.assertRaises(T.BadHead):
+                l.observe_head(forged, "monitor-forged")
+            self.assertTrue(l.cp["frozen"])
+            split = l.cp["frozen"]
+            self.assertEqual(split["kind"], "INVALID_HEAD_SIGNATURE")
+            self.assertEqual(split["status"], "OPEN")
+            # evidence kept: observation + split record
+            self.assertGreaterEqual(
+                len(l.cp.get("observations", [])), before + 1)
+            self.assertIn(split, l.cp["splits"])
+            # publication paused
+            with self.assertRaises(PublicationFrozen):
+                l.record(make_leaf("p", 3, "v3", "fp3", "P3", STAGED,
+                                   NONE_STATE, "c", "ax"))
+            # historical heads/verification unaffected by the bad input
+            pub = ed25519.public_from_secret(l.seed)
+            self.assertTrue(verify_head_signature(pub, l.head_at_size(1)))
+            self.assertTrue(verify_head_signature(pub, l.head_at_size(2)))
+            self.assertEqual(l.size, 2)
+            # another observation while frozen does not replace the conflict
+            with self.assertRaises(T.BadHead):
+                l.observe_head(forged, "monitor-retry")
+            self.assertEqual(l.cp["frozen"]["split_id"],
+                             split["split_id"])
+            # reason-gated recovery from the local branch
+            with self.assertRaises(T.SplitResolutionRejected):
+                l.resolve_split(split["split_id"], l.current_head(), "",
+                                "alice")
+            res = l.resolve_split(split["split_id"], l.current_head(),
+                                  "forged attestation rejected; local log "
+                                  "verified out of band", "alice")
+            self.assertEqual(res["chosen_size"], 2)
+            self.assertIsNone(l.cp["frozen"])
+            self.assertEqual(split["status"], "RESOLVED")
+            # publication resumes and extends the same chain
+            l.record(make_leaf("p", 3, "v3", "fp3", "P3", STAGED,
+                               NONE_STATE, "c", "ax"))
+            self.assertEqual(l.size, 3)
+            self.assertTrue(verify_head_signature(pub, l.current_head()))
+
+    def test_freeze_from_forged_attestation_survives_reopen(self):
         self._grow(1)
         with self.log.locked() as l:
             h = l.current_head()
-            h["tree_head_sig"] = "x" + h["tree_head_sig"][1:]
+            forged = dict(h)
+            forged["tree_head_sig"] = "y" + h["tree_head_sig"][1:]
             with self.assertRaises(T.BadHead):
-                l.observe_head(h)
+                l.observe_head(forged, "w")
+            sid = l.cp["frozen"]["split_id"]
+        log2 = TransparencyLog(self.dir)
+        with log2.locked() as l2:
+            self.assertEqual(l2.cp["frozen"]["split_id"], sid)
+            self.assertEqual(l2.cp["frozen"]["kind"],
+                             "INVALID_HEAD_SIGNATURE")
 
     def test_freeze_survives_reopen(self):
         self._grow(1)
@@ -767,6 +825,48 @@ class TestIndependentChecker(unittest.TestCase):
         v = verify_transparency(sec)
         codes = {f["code"] for f in v["findings"]}
         self.assertIn("SPLIT_RESOLUTION_INVALID", codes)
+
+    def test_forged_attestation_split_open_flagged_and_resolved_clean(self):
+        """An INVALID_HEAD_SIGNATURE conflict (forged monitor input) retained
+        as an OPEN split must be flagged like any unresolved freeze; once an
+        owner resolves it from the local branch with a reason and the rejected
+        evidence is kept, the offline checker passes."""
+        import copy
+        # OPEN forged-attestation freeze -> must be flagged
+        sec = copy.deepcopy(self.section)
+        open_split = {
+            "split_id": "s_forged", "kind": "INVALID_HEAD_SIGNATURE",
+            "status": "OPEN",
+            "detail": {"size": 5, "local_size": 5,
+                       "local_root": sec["heads"][-1]["root_hash"],
+                       "observed_root": sec["heads"][-1]["root_hash"]},
+            "observed_head": {"tree_size": 5,
+                              "root_hash": sec["heads"][-1]["root_hash"]}}
+        sec["splits"].append(open_split)
+        sec["frozen"] = open_split
+        v = verify_transparency(sec)
+        codes = {f["code"] for f in v["findings"]}
+        self.assertIn("SPLIT_NOT_RESOLVED", codes)
+        # PUBLISHED_DURING_SPLIT must NOT fire: no head exists above the
+        # detection size (publication really was paused).
+        self.assertNotIn("PUBLISHED_DURING_SPLIT", codes)
+
+        # after a reason-gated recovery to the provable local branch the
+        # checker is clean again (rejected evidence retained).
+        sec2 = copy.deepcopy(sec)
+        resolved = copy.deepcopy(open_split)
+        resolved["status"] = "RESOLVED"
+        sec2["splits"][-1] = resolved
+        sec2["frozen"] = None
+        sec2["resolutions"].append(
+            {"split_id": "s_forged", "decided_by": "alice",
+             "reason": "forged attestation; local branch verified",
+             "chosen_size": 5,
+             "chosen_root": sec["heads"][-1]["root_hash"],
+             "rejected": {"size": 5,
+                          "root": sec["heads"][-1]["root_hash"]}})
+        v2 = verify_transparency(sec2)
+        self.assertTrue(v2["ok"], v2["findings"])
 
 
 if __name__ == "__main__":

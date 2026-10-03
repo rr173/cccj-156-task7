@@ -11,4 +11,6 @@ echo "=== cross-region DR drill HTTP e2e (scan/blueprint/resume/mirror/lease/evi
 python3 tests/drill_http_e2e.py "${2:-8302}"
 echo "=== transparency HTTP e2e (proofs + browser recomputation + split freeze/resolve) ==="
 python3 tests/transparency_http_e2e.py "${3:-8303}"
+echo "=== transparency browser e2e (badge/member-path/chain/reload/tamper/fork recovery) ==="
+python3 tests/transparency_browser_e2e.py "${4:-8304}"
 echo "ALL TESTS PASSED"
